@@ -6,9 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import traceback
 import os
 import google.generativeai as genai
-from dotenv import load_dotenv # Import to load local .env file
+from dotenv import load_dotenv 
 
-# 1. Load Environment Variables (Look for .env file)
+# 1. Load Environment Variables
 load_dotenv()
 
 app = FastAPI()
@@ -37,35 +37,6 @@ class ExplainRequest(BaseModel):
 
 # --- GLOBAL STATE ---
 current_repo_path = None 
-
-# --- HELPER: SMART MODEL SELECTOR ---
-def get_working_model():
-    """
-    Dynamically finds a working model name to prevent 404 errors.
-    """
-    try:
-        if not GOOGLE_API_KEY:
-            return None
-            
-        genai.configure(api_key=GOOGLE_API_KEY)
-        
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        
-        # Preference order
-        for model in available_models:
-            if "gemini-1.5-flash" in model: return model
-        for model in available_models:
-            if "gemini-pro" in model: return model
-            
-        if available_models: return available_models[0]
-        return "gemini-pro"
-        
-    except Exception as e:
-        print(f"Model selection error: {e}")
-        return "gemini-pro"
 
 # --- ENDPOINTS ---
 
@@ -116,27 +87,38 @@ async def get_content(request: ContentRequest):
 @app.post("/explain")
 async def explain_code(request: ExplainRequest):
     """
-    Sends code to Google Gemini AI for an explanation.
+    Uses the 'Lite' model to avoid Rate Limits (429 errors).
     """
     if not GOOGLE_API_KEY:
         return {"explanation": "⚠️ Server Error: API Key not configured. Check .env file."}
 
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
-
         code_snippet = request.code[:2000] 
-        
-        model_name = get_working_model()
-        print(f"Using AI Model: {model_name}")
-        
-        model = genai.GenerativeModel(model_name)
-        
         prompt = f"You are a Senior Software Architect. Explain this code file briefly in 3 clear bullet points. Focus on its role in the system architecture:\n\n{code_snippet}"
+
+        # FIX: Use 'gemini-2.0-flash-lite' (Found in your list)
+        # This model is optimized for speed and has better rate limits.
+        model = genai.GenerativeModel("gemini-2.0-flash-lite")
         
         response = model.generate_content(prompt)
-        
         return {"explanation": response.text}
-        
+
     except Exception as e:
-        print(f"AI Error: {e}")
-        return {"explanation": f"AI Error: {str(e)}"}
+        error_msg = str(e)
+        print(f"AI Error: {error_msg}")
+        
+        # If Lite fails, try the generic 'flash-latest' alias as a backup
+        if "404" in error_msg:
+             try:
+                 print("⚠️ Lite model not found, trying 'gemini-flash-latest'...")
+                 model = genai.GenerativeModel("gemini-flash-latest")
+                 response = model.generate_content(prompt)
+                 return {"explanation": response.text}
+             except Exception as inner_e:
+                 return {"explanation": f"AI Error: {str(inner_e)}"}
+
+        if "429" in error_msg:
+            return {"explanation": "⚠️ AI usage limit reached. Please wait 30 seconds."}
+            
+        return {"explanation": f"AI Error: {error_msg}"}
