@@ -6,10 +6,13 @@ from fastapi.middleware.cors import CORSMiddleware
 import traceback
 import os
 import google.generativeai as genai
+from dotenv import load_dotenv # Import to load local .env file
+
+# 1. Load Environment Variables (Look for .env file)
+load_dotenv()
 
 app = FastAPI()
 
-# --- CONFIGURATION ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,8 +21,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# YOUR API KEY
-GOOGLE_API_KEY = "AIzaSyCponxtZA9atROZU5ejs5tZdRD5SXJUJAI"
+# 2. Get Key Securely
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # --- REQUEST MODELS ---
 class RepoRequest(BaseModel):
@@ -39,33 +42,26 @@ current_repo_path = None
 def get_working_model():
     """
     Dynamically finds a working model name to prevent 404 errors.
-    Prioritizes 1.5-Flash, then Pro, then fallback.
     """
     try:
+        if not GOOGLE_API_KEY:
+            return None
+            
         genai.configure(api_key=GOOGLE_API_KEY)
         
-        # 1. Ask Google what models are available to THIS key
         available_models = []
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
                 available_models.append(m.name)
         
-        # 2. Pick the best one
-        # Preference order: 1.5 Flash -> 1.5 Pro -> Pro -> Any
+        # Preference order
         for model in available_models:
             if "gemini-1.5-flash" in model: return model
-        
-        for model in available_models:
-            if "gemini-1.5-pro" in model: return model
-            
         for model in available_models:
             if "gemini-pro" in model: return model
             
-        # 3. Fallback: Just take the first one found
-        if available_models:
-            return available_models[0]
-            
-        return "gemini-pro" # Absolute backup
+        if available_models: return available_models[0]
+        return "gemini-pro"
         
     except Exception as e:
         print(f"Model selection error: {e}")
@@ -82,7 +78,6 @@ async def visualize_repo(request: RepoRequest):
     global current_repo_path
     repo_path = None
     try:
-        # Cleanup previous session
         if current_repo_path and os.path.exists(current_repo_path):
             try:
                 delete_repository(current_repo_path)
@@ -91,7 +86,6 @@ async def visualize_repo(request: RepoRequest):
 
         print(f"--- STARTING PROCESS for {request.url} ---")
         
-        # Clone and Parse
         repo_path = clone_repository(request.url)
         current_repo_path = repo_path 
         graph_data = parse_repo(repo_path)
@@ -124,16 +118,16 @@ async def explain_code(request: ExplainRequest):
     """
     Sends code to Google Gemini AI for an explanation.
     """
+    if not GOOGLE_API_KEY:
+        return {"explanation": "⚠️ Server Error: API Key not configured. Check .env file."}
+
     try:
-        # 1. Force Configuration
         genai.configure(api_key=GOOGLE_API_KEY)
 
-        # 2. Limit text length
         code_snippet = request.code[:2000] 
         
-        # 3. SMART SELECTION (The Fix)
         model_name = get_working_model()
-        print(f"Using AI Model: {model_name}") # This prints to your terminal so you know which one worked
+        print(f"Using AI Model: {model_name}")
         
         model = genai.GenerativeModel(model_name)
         
