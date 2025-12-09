@@ -5,6 +5,7 @@ from services.parser_service import parse_repo
 from fastapi.middleware.cors import CORSMiddleware
 import traceback
 import os
+import hashlib # NEW: For caching results
 import google.generativeai as genai
 from dotenv import load_dotenv 
 
@@ -23,6 +24,9 @@ app.add_middleware(
 
 # 2. Get Key Securely
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# --- CACHE STORAGE (Saves money and time) ---
+explanation_cache = {} 
 
 # --- REQUEST MODELS ---
 class RepoRequest(BaseModel):
@@ -49,6 +53,9 @@ async def visualize_repo(request: RepoRequest):
     global current_repo_path
     repo_path = None
     try:
+        # Clear cache when loading a new repo to save memory
+        explanation_cache.clear()
+        
         if current_repo_path and os.path.exists(current_repo_path):
             try:
                 delete_repository(current_repo_path)
@@ -87,38 +94,58 @@ async def get_content(request: ContentRequest):
 @app.post("/explain")
 async def explain_code(request: ExplainRequest):
     """
-    Uses the 'Lite' model to avoid Rate Limits (429 errors).
+    Ultimate AI Handler:
+    1. Checks Cache (Instant result if already asked)
+    2. Rotates Models (Lite -> Latest -> Pro) to bypass limits
     """
     if not GOOGLE_API_KEY:
         return {"explanation": "⚠️ Server Error: API Key not configured. Check .env file."}
+
+    # 1. CACHE CHECK (Zero Quota Usage)
+    # Create a unique ID for this code snippet
+    code_hash = hashlib.md5(request.code.encode()).hexdigest()
+    if code_hash in explanation_cache:
+        print("⚡ Serving from Cache (Fast!)")
+        return {"explanation": explanation_cache[code_hash]}
 
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
         code_snippet = request.code[:2000] 
         prompt = f"You are a Senior Software Architect. Explain this code file briefly in 3 clear bullet points. Focus on its role in the system architecture:\n\n{code_snippet}"
 
-        # FIX: Use 'gemini-2.0-flash-lite' (Found in your list)
-        # This model is optimized for speed and has better rate limits.
-        model = genai.GenerativeModel("gemini-2.0-flash-lite")
+        # 2. MODEL ROTATION LIST
+        # If one is busy, we try the next one immediately.
+        models_to_try = [
+            "gemini-2.0-flash-lite",  # Try Lite first (Fastest)
+            "gemini-flash-latest",    # Fallback to Flash
+            "gemini-pro"              # Last resort (Slow but reliable)
+        ]
+
+        last_error = ""
+
+        for model_name in models_to_try:
+            try:
+                print(f"🔄 Trying model: {model_name}...")
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt)
+                
+                # Success! Save to cache and return
+                result_text = response.text
+                explanation_cache[code_hash] = result_text 
+                return {"explanation": result_text}
+
+            except Exception as e:
+                error_msg = str(e)
+                print(f"⚠️ {model_name} failed: {error_msg}")
+                last_error = error_msg
+                # If it's a 404 (Not Found) or 429 (Busy), we just continue to the next model in the list
+                continue
+
+        # If we loop through ALL models and fail:
+        if "429" in last_error:
+             return {"explanation": "⚠️ All AI models are busy. Please wait 1 minute."}
         
-        response = model.generate_content(prompt)
-        return {"explanation": response.text}
+        return {"explanation": f"AI Error: {last_error}"}
 
     except Exception as e:
-        error_msg = str(e)
-        print(f"AI Error: {error_msg}")
-        
-        # If Lite fails, try the generic 'flash-latest' alias as a backup
-        if "404" in error_msg:
-             try:
-                 print("⚠️ Lite model not found, trying 'gemini-flash-latest'...")
-                 model = genai.GenerativeModel("gemini-flash-latest")
-                 response = model.generate_content(prompt)
-                 return {"explanation": response.text}
-             except Exception as inner_e:
-                 return {"explanation": f"AI Error: {str(inner_e)}"}
-
-        if "429" in error_msg:
-            return {"explanation": "⚠️ AI usage limit reached. Please wait 30 seconds."}
-            
-        return {"explanation": f"AI Error: {error_msg}"}
+        return {"explanation": f"System Error: {str(e)}"}
